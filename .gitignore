@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# Whitelist: only these files are tracked
+!.gitignore
+!file_tree_viewer.html
+!list_drive_files.py
+!capacity.example.json

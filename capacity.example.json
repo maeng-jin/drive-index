@@ -1,0 +1,17 @@
+{
+  "a": {
+    "label": "External Drive A",
+    "capacity": 5000000000000,
+    "offset": 0
+  },
+  "b": {
+    "label": "External Drive B",
+    "capacity": 4000000000000,
+    "offset": 0
+  },
+  "c": {
+    "label": "Backup Drive",
+    "capacity": 2000000000000,
+    "offset": 0
+  }
+}
