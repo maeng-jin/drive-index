@@ -3,6 +3,7 @@
 
 # Whitelist: only these files are tracked
 !.gitignore
+!README.md
 !file_tree_viewer.html
 !list_drive_files.py
 !capacity.example.json
