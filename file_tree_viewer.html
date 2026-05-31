@@ -3419,30 +3419,127 @@ document.getElementById('btn-size-mode').addEventListener('click', e => {
   else rerenderPreservingExpansion();
 });
 
+// 드라이브의 모든 폴더 경로를 renderTree가 쓰는 키 형식으로 수집
+function collectAllFolderPaths(drive, out) {
+  const walk = (node, parentPath) => {
+    for (const [name, child] of node.children) {
+      const p = parentPath ? `${parentPath}/${name}` : `${drive.id}:${name}`;
+      out.add(p);
+      if (child.children.size) walk(child, p);
+    }
+  };
+  walk(drive.root, null);
+}
+
+// 선택된(또는 일부 선택된) 가지의 폴더 경로만 수집.
+//   _selected 폴더 → 하위 전체가 선택 → 서브트리 모두 펼침
+//   _partial 폴더  → 선택 항목으로 가는 경로만 따라 내려감
+function collectSelectedFolderPaths(drive, out) {
+  const walk = (node, parentPath) => {
+    for (const [name, child] of node.children) {
+      if (!child._selected && !child._partial) continue;
+      const p = parentPath ? `${parentPath}/${name}` : `${drive.id}:${name}`;
+      out.add(p);
+      if (child.children.size) walk(child, p);
+    }
+  };
+  walk(drive.root, null);
+}
+
 document.getElementById('btn-expand').addEventListener('click', () => {
-  for (let pass = 0; pass < 8; pass++) {
-    const folders = treeContainer.querySelectorAll('.folder-row');
-    let didExpand = false;
-    folders.forEach(row => {
-      const children = row.nextElementSibling;
-      if (children && children.classList.contains('collapsed')) {
-        row.click();
-        didExpand = true;
-      }
-    });
-    if (!didExpand) break;
+  const targets = mergeMode ? drives : [activeDrive()].filter(Boolean);
+  if (!targets.length) return;
+
+  const mergedCollapsed = new Set();
+  treeContainer.querySelectorAll('.tree-children.collapsed[data-merged-root]').forEach(c => {
+    mergedCollapsed.add(c.dataset.mergedRoot);
+  });
+
+  // 선택된 항목이 있으면 그 가지만 펼친다 (전체가 아니라 선택 영역만)
+  const selectedPaths = new Set();
+  for (const d of targets) collectSelectedFolderPaths(d, selectedPaths);
+  if (selectedPaths.size) {
+    renderTree(selectedPaths, mergedCollapsed);
+    return;
   }
+
+  // 선택이 없으면 전체 펼침. 펼칠 행 수를 메타데이터로 미리 추산 (DOM은 만지지 않음)
+  let rowEstimate = 0;
+  for (const d of targets) {
+    rowEstimate += foldersOnly ? d.totalFolders : d.totalFolders + d.totalFiles;
+  }
+
+  const WARN_LIMIT = 20000;
+  if (rowEstimate > WARN_LIMIT) {
+    const lines = [
+      `전체를 펼치면 약 ${rowEstimate.toLocaleString()}개의 행이 한꺼번에 그려집니다.`,
+      `이 정도 양은 브라우저가 크게 느려지거나 멈출 수 있습니다.`,
+      '',
+    ];
+    if (!foldersOnly) {
+      lines.push(`💡 'Folders only'를 켜고 펼치면 폴더만 표시되어 훨씬 가볍습니다.`, '');
+    }
+    lines.push('그래도 모두 펼치시겠습니까?');
+    if (!confirm(lines.join('\n'))) return;
+  }
+
+  // 모든 폴더 경로를 모아 단일 렌더로 펼침 (기존 8-pass click 방식은 O(N²))
+  const expandedPaths = new Set();
+  for (const d of targets) collectAllFolderPaths(d, expandedPaths);
+
+  renderTree(expandedPaths, mergedCollapsed);
 });
 
-document.getElementById('btn-collapse').addEventListener('click', () => {
-  treeContainer.querySelectorAll('.tree-children:not(.collapsed)').forEach(c => {
-    c.classList.add('collapsed');
-    const row = c.previousElementSibling;
-    if (row) {
-      const toggle = row.querySelector('.toggle');
-      if (toggle && toggle.textContent === '▾') toggle.textContent = '▸';
+// .tree-children 요소를 접고 토글 표시를 갱신
+function collapseChildrenEl(c) {
+  if (!c || c.classList.contains('collapsed')) return;
+  c.classList.add('collapsed');
+  const row = c.previousElementSibling;
+  const toggle = row && row.querySelector('.toggle');
+  if (toggle && toggle.textContent === '▾') toggle.textContent = '▸';
+}
+
+// 선택이 "실제로 위치한" 폴더만 수집 (접기 대상).
+//   - 완전 선택(_selected) 폴더 또는 직접 선택된 파일을 가진 폴더 → 그 폴더에서 접음
+//   - 그 외 통과용 부분선택(_partial) 폴더 → 접지 않고 더 내려감 (상위 경로는 열어둠)
+function collectSelectedCollapseTargets(drive, out) {
+  const walk = (node, parentPath) => {
+    for (const [name, child] of node.children) {
+      if (!child._selected && !child._partial) continue;
+      const p = parentPath ? `${parentPath}/${name}` : `${drive.id}:${name}`;
+      if (child._selected || child.files.some(f => f._selected)) {
+        out.add(p);            // 선택이 시작된 폴더 → 접으면 하위는 가려짐
+      } else {
+        walk(child, p);        // 통과 폴더 → 열어둔 채 더 탐색
+      }
     }
+  };
+  walk(drive.root, null);
+}
+
+document.getElementById('btn-collapse').addEventListener('click', () => {
+  const targets = mergeMode ? drives : [activeDrive()].filter(Boolean);
+
+  // 선택된 항목이 있으면 선택이 위치한 폴더만 접는다 (상위 경로는 그대로 열어둠)
+  const selectedPaths = new Set();
+  for (const d of targets) collectSelectedCollapseTargets(d, selectedPaths);
+  if (selectedPaths.size) {
+    for (const p of selectedPaths) {
+      collapseChildrenEl(treeContainer.querySelector(`.tree-children[data-path="${cssEscape(p)}"]`));
+    }
+    return;
+  }
+
+  // 선택이 없으면 전체 접기
+  const mergedCollapsed = new Set();
+  treeContainer.querySelectorAll('.tree-children.collapsed[data-merged-root]').forEach(c => {
+    mergedCollapsed.add(c.dataset.mergedRoot);
   });
+  // 1) 접힌 상태로 새로 그려 거대해진 DOM을 회수 (초기 로드 수준 크기로 축소)
+  renderTree(null, mergedCollapsed);
+  // 2) 초기 펼침으로 남은 상위 폴더까지 모두 접기 — 이제 DOM이 작아 가볍게 처리됨
+  treeContainer.querySelectorAll('.tree-children:not(.collapsed):not([data-merged-root])').forEach(collapseChildrenEl);
+  treeContainer.scrollTop = 0;
 });
 
 document.getElementById('btn-reset').addEventListener('click', () => {
