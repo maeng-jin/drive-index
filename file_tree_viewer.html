@@ -926,6 +926,71 @@
     cursor: not-allowed;
   }
 
+  /* Server status badge in footer */
+  .server-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+    margin-right: 10px;
+  }
+  .server-badge.connected {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .server-badge .indicator {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ink-dimmer);
+  }
+  .server-badge.connected .indicator {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+  }
+  .server-badge .reload-btn {
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0 2px;
+    line-height: 1;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+  }
+  .server-badge .reload-btn:hover { opacity: 1; }
+
+  /* Loading splash while fetching from server */
+  .splash {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    z-index: 500;
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+  .splash .spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid var(--line);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* Copy path button */
   .copy-path-btn {
     display: none;
@@ -1008,8 +1073,20 @@
 
 <footer>
   <span id="source-info">— no file loaded —</span>
-  <span>Drag &amp; drop · multiple files supported</span>
+  <span>
+    <span id="server-badge" class="server-badge hidden">
+      <span class="indicator"></span>
+      <span id="server-badge-text">로컬 모드</span>
+      <button id="server-reload" class="reload-btn hidden" title="서버에서 다시 불러오기">⟳</button>
+    </span>
+    Drag &amp; drop · multiple files supported
+  </span>
 </footer>
+
+<div id="splash" class="splash hidden">
+  <div class="spinner"></div>
+  <div id="splash-text">서버에서 캐시 목록을 가져오는 중…</div>
+</div>
 
 <div class="drop-overlay" id="drop-overlay">
   <div class="text">+ add another file list</div>
@@ -1061,11 +1138,118 @@ const dropOverlay = document.getElementById('drop-overlay');
 const dashboardEl = document.getElementById('dashboard');
 const dashboardGridEl = document.getElementById('dashboard-grid');
 
+const splashEl = document.getElementById('splash');
+const splashTextEl = document.getElementById('splash-text');
+const serverBadgeEl = document.getElementById('server-badge');
+const serverBadgeTextEl = document.getElementById('server-badge-text');
+const serverReloadBtn = document.getElementById('server-reload');
+let serverConnected = false;
+let serverManifest = null;
+
 browseBtn.addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
 dropZone.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', e => {
   if (e.target.files.length) loadFiles([...e.target.files]);
 });
+
+serverReloadBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  reloadFromServer();
+});
+
+window.addEventListener('DOMContentLoaded', () => {
+  // file:// 프로토콜로 열렸으면 서버 시도하지 않음
+  if (location.protocol === 'file:') {
+    setServerStatus(false, '로컬 모드 (드래그 앤 드롭)');
+    return;
+  }
+  loadFromServer();
+});
+
+function setServerStatus(connected, text) {
+  serverConnected = connected;
+  serverBadgeEl.classList.remove('hidden');
+  serverBadgeEl.classList.toggle('connected', connected);
+  serverBadgeTextEl.textContent = text;
+  serverReloadBtn.classList.toggle('hidden', !connected);
+}
+
+async function loadFromServer() {
+  splashEl.classList.remove('hidden');
+  splashTextEl.textContent = '서버에서 캐시 목록을 가져오는 중…';
+  try {
+    const r = await fetch('/api/manifest', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const manifest = await r.json();
+    serverManifest = manifest;
+
+    const driveList = manifest.drives || [];
+    if (!driveList.length) {
+      setServerStatus(true, '서버 모드 (캐시 비어있음)');
+      splashEl.classList.add('hidden');
+      return;
+    }
+
+    splashTextEl.textContent = `${driveList.length}개 드라이브 로드 중…`;
+
+    // 순차적으로 받아오되 너무 느리지 않게 병렬화
+    const results = await Promise.all(driveList.map(async d => {
+      try {
+        const resp = await fetch(d.txt_url, { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const text = await resp.text();
+        const drive = parseFileList(text, d.filename);
+        if (drive && d.thumbnail_url) {
+          drive.thumbnailUrl = d.thumbnail_url;
+          drive.thumbnailName = d.thumbnail_filename;
+        }
+        return drive;
+      } catch (err) {
+        console.warn(`드라이브 로드 실패: ${d.filename}`, err);
+        return null;
+      }
+    }));
+
+    for (const d of results) if (d) drives.push(d);
+
+    // 용량 정보 적용
+    if (manifest.capacity && Object.keys(manifest.capacity).length) {
+      const parsed = parseCapacityObject(manifest.capacity);
+      if (parsed) {
+        applyCapacityMap(parsed.map);
+        reorderDrivesByJson(parsed.order);
+      }
+    }
+
+    dashboardMode = true;
+    if (drives.length) activeDriveId = drives[0].id;
+
+    setServerStatus(true, `서버 모드 (${drives.length}개 드라이브)`);
+    render();
+  } catch (err) {
+    console.log('서버 미접속 — 로컬 모드로 동작:', err.message);
+    setServerStatus(false, '로컬 모드 (드래그 앤 드롭)');
+  } finally {
+    splashEl.classList.add('hidden');
+  }
+}
+
+async function reloadFromServer() {
+  if (!confirm('서버에서 캐시 목록을 다시 불러옵니다. 현재 로드된 드라이브는 모두 사라집니다. 계속할까요?')) return;
+  // 기존 blob URL들 정리
+  drives.forEach(d => {
+    if (d.thumbnailUrl && d.thumbnailUrl.startsWith('blob:')) URL.revokeObjectURL(d.thumbnailUrl);
+  });
+  drives.length = 0;
+  activeDriveId = null;
+  mergeMode = false;
+  dashboardMode = true;
+  nextDriveId = 1;
+  searchInput.value = '';
+  closeLightbox();
+  selectionBar.classList.add('hidden');
+  await loadFromServer();
+}
 
 ['dragenter', 'dragover'].forEach(evt => {
   dropZone.addEventListener(evt, e => {
@@ -1212,57 +1396,62 @@ function finishLoad(imgFiles, jsonFiles) {
  *   { "drives": [{ "name": "a", "capacity": 4000768323584 }, ...] }
  *   { "drives": [{ "name": "a", "capacity_bytes": 4000... }, ...] }  (also "size", "bytes", "total")
  */
+function parseCapacityObject(data) {
+  // map: { driveKey: { capacity, offset, label } }
+  // order: [driveKey, ...] — JSON 입력 순서 유지
+  const map = {};
+  const order = [];
+
+  const setEntry = (key, capacity, offset, label) => {
+    if (!key) return;
+    const k = key.toLowerCase();
+    if (!(k in map)) order.push(k);
+    map[k] = {
+      capacity: capacity != null ? capacity : null,
+      offset: offset || 0,
+      label: label || null,
+    };
+  };
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      setEntry(extractKey(item), extractBytes(item), extractOffset(item), extractLabel(item));
+    }
+  } else if (data && typeof data === 'object') {
+    if (Array.isArray(data.drives)) {
+      for (const item of data.drives) {
+        setEntry(extractKey(item), extractBytes(item), extractOffset(item), extractLabel(item));
+      }
+    } else {
+      // Flat object: { a: 4000..., b: { capacity, offset, label }, ... }
+      for (const [key, val] of Object.entries(data)) {
+        if (typeof val === 'number') {
+          setEntry(key, val, 0, null);
+        } else if (val && typeof val === 'object') {
+          setEntry(key, extractBytes(val), extractOffset(val), extractLabel(val));
+        } else if (typeof val === 'string') {
+          setEntry(key, null, 0, val);
+        }
+      }
+    }
+  }
+
+  return order.length ? { map, order } : null;
+}
+
 function parseCapacityJson(file) {
   return new Promise(resolve => {
     const reader = new FileReader();
     reader.onload = e => {
       try {
         const data = JSON.parse(e.target.result);
-        // map: { driveKey: { capacity, offset, label } }
-        // order: [driveKey, ...] — JSON 입력 순서 유지
-        const map = {};
-        const order = [];
-
-        const setEntry = (key, capacity, offset, label) => {
-          if (!key) return;
-          const k = key.toLowerCase();
-          if (!(k in map)) order.push(k);
-          map[k] = {
-            capacity: capacity != null ? capacity : null,
-            offset: offset || 0,
-            label: label || null,
-          };
-        };
-
-        if (Array.isArray(data)) {
-          for (const item of data) {
-            setEntry(extractKey(item), extractBytes(item), extractOffset(item), extractLabel(item));
-          }
-        } else if (data && typeof data === 'object') {
-          if (Array.isArray(data.drives)) {
-            for (const item of data.drives) {
-              setEntry(extractKey(item), extractBytes(item), extractOffset(item), extractLabel(item));
-            }
-          } else {
-            // Flat object: { a: 4000..., b: { capacity, offset, label }, ... }
-            for (const [key, val] of Object.entries(data)) {
-              if (typeof val === 'number') {
-                setEntry(key, val, 0, null);
-              } else if (val && typeof val === 'object') {
-                setEntry(key, extractBytes(val), extractOffset(val), extractLabel(val));
-              } else if (typeof val === 'string') {
-                setEntry(key, null, 0, val);
-              }
-            }
-          }
-        }
-
-        if (!order.length) {
+        const result = parseCapacityObject(data);
+        if (!result) {
           console.warn(`No capacity entries parsed from ${file.name}`);
           alert(`${file.name}에서 용량/라벨 정보를 읽지 못했습니다. JSON 형식을 확인하세요.`);
           resolve(null);
         } else {
-          resolve({ map, order });
+          resolve(result);
         }
       } catch (err) {
         alert(`JSON 파싱 실패 (${file.name}): ${err.message}`);
