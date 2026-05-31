@@ -657,6 +657,13 @@
     font-size: 9px;
     flex-shrink: 0;
   }
+  /* 검색 결과에서 하위 매칭을 접고 펼치는 토글 — 또렷하게 보이도록 */
+  .node-row .toggle.expandable {
+    color: var(--accent);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .node-row .toggle.expandable:hover { color: var(--ink); }
   .node-row .icon {
     width: 16px;
     flex-shrink: 0;
@@ -2879,81 +2886,159 @@ function filterTree(query) {
   copyResultsBtn.classList.remove('hidden');
   copyResultsBtn.textContent = `결과 복사 (${filteredMatches.length})`;
 
-  for (const m of filteredMatches) {
-    const row = document.createElement('div');
-    row.className = 'node-row ' + (m.isFolder ? 'folder-row' : 'file-row');
+  // 매칭된 폴더가 다른 매칭(파일/하위폴더)의 상위 경로이면 그 아래로 접어서 중첩 렌더.
+  const roots = buildMatchTree(filteredMatches);
+  renderMatchNodes(roots, [], query, treeContainer);
+}
 
-    // Reflect current selection state
-    if (m.isFolder) {
-      if (m.ref._selected) row.classList.add('selected');
-      else if (m.ref._partial) row.classList.add('partial');
-    } else {
-      if (m.ref._selected) row.classList.add('selected');
+/**
+ * 평면 매칭 목록을 경로 접두어 관계로 중첩 트리로 변환.
+ * 각 매칭은 가장 가까운(가장 깊은) 상위 매칭 폴더의 _children에 들어간다.
+ * 상위 매칭 폴더가 없으면 최상위(roots)로 남는다.
+ */
+function buildMatchTree(matches) {
+  matches.forEach(m => { m._children = []; });
+  const folders = matches.filter(m => m.isFolder);
+  const isPrefix = (a, b) => {
+    if (a.length > b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  const roots = [];
+  for (const m of matches) {
+    let best = null;
+    // 폴더 매칭: 자기 경로(pathSegs)의 진부분 접두어여야 함
+    // 파일 매칭: pathSegs는 부모 폴더 경로 → 같거나 짧은 접두어면 그 폴더 안에 있음
+    for (const f of folders) {
+      if (f === m || f.drive !== m.drive) continue;
+      if (m.isFolder ? f.pathSegs.length >= m.pathSegs.length
+                     : f.pathSegs.length > m.pathSegs.length) continue;
+      if (!isPrefix(f.pathSegs, m.pathSegs)) continue;
+      if (!best || f.pathSegs.length > best.pathSegs.length) best = f;
     }
-
-    const checkbox = document.createElement('span');
-    checkbox.className = 'checkbox';
-    checkbox.addEventListener('click', e => {
-      e.stopPropagation();
-      if (m.isFolder) {
-        toggleFolderSelection(m.ref, m.drive);
-      } else {
-        toggleFileSelection(m.ref, m.drive, row);
-      }
-    });
-
-    const toggle = document.createElement('span');
-    toggle.className = 'toggle';
-    toggle.textContent = ' ';
-
-    const icon = document.createElement('span');
-    icon.className = 'icon';
-    icon.textContent = m.isFolder ? '/' : '';
-    if (m.isFolder) icon.style.color = m.drive.color;
-
-    const name = document.createElement('span');
-    name.className = 'name';
-    name.innerHTML = highlightMatch(m.path, query);
-
-    row.appendChild(checkbox);
-    row.appendChild(toggle);
-    row.appendChild(icon);
-    row.appendChild(name);
-
-    // 행 전체 클릭 시 트리 위치로 이동 (체크박스 클릭은 stopPropagation으로 분리됨)
-    row.style.cursor = 'pointer';
-    row.title = 'Click to navigate to this location in the tree';
-    row.addEventListener('click', () => navigateToMatch(m));
-
-    if (mergeMode) {
-      const badge = document.createElement('span');
-      badge.className = 'drive-badge';
-      badge.style.setProperty('--drive-accent', m.drive.color);
-      badge.textContent = driveShortName(m.drive).replace(/\.(txt|tsv|csv)$/i, '').slice(0, 24);
-      row.appendChild(badge);
-    }
-
-    if (m.drive.hasSizes && m.size > 0) {
-      const meta = document.createElement('span');
-      meta.className = 'meta';
-      meta.textContent = formatSizeWithMode(m.size);
-      row.appendChild(meta);
-    }
-
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'copy-path-btn';
-    copyBtn.textContent = '⧉';
-    copyBtn.title = '경로 복사';
-    copyBtn.addEventListener('click', e => {
-      e.stopPropagation();
-      const sep = m.drive.sep || '/';
-      const segs = m.isFolder ? m.pathSegs : [...m.pathSegs, m.ref.name];
-      navigator.clipboard.writeText(segsToFsPath(segs, sep)).then(() => showCopiedFeedback(copyBtn));
-    });
-    row.appendChild(copyBtn);
-
-    treeContainer.appendChild(row);
+    if (best) best._children.push(m);
+    else roots.push(m);
   }
+  return roots;
+}
+
+function countMatchDescendants(m) {
+  let n = 0;
+  for (const c of m._children) n += 1 + countMatchDescendants(c);
+  return n;
+}
+
+/** 중첩 매칭 노드를 재귀적으로 렌더. parentSegs 기준 상대 경로를 라벨로 표시. */
+function renderMatchNodes(nodes, parentSegs, query, container) {
+  for (const m of nodes) {
+    const fullSegs = m.isFolder ? m.pathSegs : [...m.pathSegs, m.ref.name];
+    const label = fullSegs.slice(parentSegs.length).join('/') || fullSegs[fullSegs.length - 1];
+    const row = buildSearchRow(m, query, label);
+
+    const hasChildren = m._children && m._children.length;
+    if (hasChildren) {
+      const childWrap = document.createElement('div');
+      childWrap.className = 'tree-children collapsed';
+
+      const toggle = row.querySelector('.toggle');
+      toggle.classList.add('expandable');
+      toggle.textContent = '▸';
+      toggle.addEventListener('click', e => {
+        e.stopPropagation();
+        const collapsed = childWrap.classList.toggle('collapsed');
+        toggle.textContent = collapsed ? '▸' : '▾';
+      });
+
+      const countSpan = document.createElement('span');
+      countSpan.className = 'count';
+      countSpan.textContent = `(${countMatchDescendants(m)})`;
+      const nameEl = row.querySelector('.name');
+      row.insertBefore(countSpan, nameEl.nextSibling);
+
+      container.appendChild(row);
+      renderMatchNodes(m._children, m.pathSegs, query, childWrap);
+      container.appendChild(childWrap);
+    } else {
+      container.appendChild(row);
+    }
+  }
+}
+
+/** 검색 결과 한 행(node-row)을 만들어 반환. label은 표시할 텍스트(상대/전체 경로). */
+function buildSearchRow(m, query, label) {
+  const row = document.createElement('div');
+  row.className = 'node-row ' + (m.isFolder ? 'folder-row' : 'file-row');
+
+  // Reflect current selection state
+  if (m.isFolder) {
+    if (m.ref._selected) row.classList.add('selected');
+    else if (m.ref._partial) row.classList.add('partial');
+  } else {
+    if (m.ref._selected) row.classList.add('selected');
+  }
+
+  const checkbox = document.createElement('span');
+  checkbox.className = 'checkbox';
+  checkbox.addEventListener('click', e => {
+    e.stopPropagation();
+    if (m.isFolder) {
+      toggleFolderSelection(m.ref, m.drive);
+    } else {
+      toggleFileSelection(m.ref, m.drive, row);
+    }
+  });
+
+  const toggle = document.createElement('span');
+  toggle.className = 'toggle';
+  toggle.textContent = ' ';
+
+  const icon = document.createElement('span');
+  icon.className = 'icon';
+  icon.textContent = m.isFolder ? '/' : '';
+  if (m.isFolder) icon.style.color = m.drive.color;
+
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.innerHTML = highlightMatch(label, query);
+
+  row.appendChild(checkbox);
+  row.appendChild(toggle);
+  row.appendChild(icon);
+  row.appendChild(name);
+
+  // 행 전체 클릭 시 트리 위치로 이동 (체크박스/토글 클릭은 stopPropagation으로 분리됨)
+  row.style.cursor = 'pointer';
+  row.title = 'Click to navigate to this location in the tree';
+  row.addEventListener('click', () => navigateToMatch(m));
+
+  if (mergeMode) {
+    const badge = document.createElement('span');
+    badge.className = 'drive-badge';
+    badge.style.setProperty('--drive-accent', m.drive.color);
+    badge.textContent = driveShortName(m.drive).replace(/\.(txt|tsv|csv)$/i, '').slice(0, 24);
+    row.appendChild(badge);
+  }
+
+  if (m.drive.hasSizes && m.size > 0) {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = formatSizeWithMode(m.size);
+    row.appendChild(meta);
+  }
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-path-btn';
+  copyBtn.textContent = '⧉';
+  copyBtn.title = '경로 복사';
+  copyBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    const sep = m.drive.sep || '/';
+    const segs = m.isFolder ? m.pathSegs : [...m.pathSegs, m.ref.name];
+    navigator.clipboard.writeText(segsToFsPath(segs, sep)).then(() => showCopiedFeedback(copyBtn));
+  });
+  row.appendChild(copyBtn);
+
+  return row;
 }
 
 /**
