@@ -139,6 +139,45 @@
     font-size: 11px;
     color: var(--ink-dimmer);
   }
+  /* 기본 폴더 자동 불러오기 */
+  .default-dir {
+    margin-top: 22px;
+    padding-top: 18px;
+    border-top: 1px dashed var(--line);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+  }
+  .drop-zone .browse-btn.ghost {
+    padding: 6px 16px;
+    font-size: 11px;
+    color: var(--ink-dim);
+  }
+  .default-dir-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--ink-dim);
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .default-dir-status .dir-name { color: var(--accent); }
+  .mini-btn {
+    background: var(--bg-soft);
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+    padding: 3px 10px;
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: all 0.15s;
+  }
+  .mini-btn:hover { border-color: var(--ink-dim); color: var(--ink); }
+  .mini-btn.accent { border-color: var(--accent); color: var(--accent); }
+  .mini-btn.accent:hover { background: var(--accent-soft); }
 
   /* Dashboard */
   .dashboard {
@@ -1049,6 +1088,10 @@
   <button class="browse-btn" id="browse-btn">Choose Files</button>
   <input type="file" id="file-input" accept=".txt,.tsv,.csv,.json,image/*" multiple style="display:none">
   <div class="hint">drop .txt + .png + .json together — viewer matches them by name prefix</div>
+  <div class="default-dir" id="default-dir">
+    <button class="browse-btn ghost" id="pick-dir-btn">기본 폴더 지정</button>
+    <span class="default-dir-status hidden" id="default-dir-status"></span>
+  </div>
 </div>
 
 <div class="tabs-bar hidden" id="tabs-bar"></div>
@@ -1159,6 +1202,10 @@ fileInput.addEventListener('change', e => {
   if (e.target.files.length) loadFiles([...e.target.files]);
 });
 
+const pickDirBtn = document.getElementById('pick-dir-btn');
+const defaultDirStatus = document.getElementById('default-dir-status');
+pickDirBtn.addEventListener('click', e => { e.stopPropagation(); pickDefaultDir(); });
+
 serverReloadBtn.addEventListener('click', e => {
   e.stopPropagation();
   reloadFromServer();
@@ -1168,10 +1215,157 @@ window.addEventListener('DOMContentLoaded', () => {
   // file:// 프로토콜로 열렸으면 서버 시도하지 않음
   if (location.protocol === 'file:') {
     setServerStatus(false, '로컬 모드 (드래그 앤 드롭)');
+    tryAutoLoadDefaultDir();
     return;
   }
   loadFromServer();
 });
+
+// ─────────────────────────────────────────────────────────────
+// 기본 폴더 자동 불러오기 (File System Access API + IndexedDB)
+//   - 한 번 폴더를 지정하면 핸들을 IndexedDB에 저장
+//   - 다음에 file://로 열 때 권한이 남아 있으면 자동 로드,
+//     아니면 클릭 한 번으로 권한을 재요청해 로드
+// ─────────────────────────────────────────────────────────────
+const DIR_DB = 'filetree-fs';
+const DIR_STORE = 'handles';
+const DIR_KEY = 'defaultDir';
+
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DIR_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(DIR_STORE);
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+function idbReq(mode, fn) {
+  return idbOpen().then(db => new Promise((res, rej) => {
+    const tx = db.transaction(DIR_STORE, mode);
+    const out = fn(tx.objectStore(DIR_STORE));
+    tx.oncomplete = () => res(out && out.result !== undefined ? out.result : undefined);
+    tx.onerror = () => rej(tx.error);
+  }));
+}
+const idbSetHandle = h => idbReq('readwrite', s => s.put(h, DIR_KEY));
+const idbGetHandle = () => idbReq('readonly', s => s.get(DIR_KEY));
+const idbDelHandle = () => idbReq('readwrite', s => s.delete(DIR_KEY));
+
+const FS_SUPPORTED = typeof window.showDirectoryPicker === 'function';
+
+async function ensureDirPermission(handle) {
+  const opts = { mode: 'read' };
+  if ((await handle.queryPermission(opts)) === 'granted') return true;
+  if ((await handle.requestPermission(opts)) === 'granted') return true;
+  return false;
+}
+
+async function collectFilesFromDir(dirHandle) {
+  const out = [];
+  for await (const entry of dirHandle.values()) {
+    if (entry.kind !== 'file') continue;
+    if (/\.(txt|tsv|csv|json|png|jpe?g|gif|webp|bmp|svg)$/i.test(entry.name)) {
+      try { out.push(await entry.getFile()); } catch (_) { /* skip unreadable */ }
+    }
+  }
+  return out;
+}
+
+async function loadFromDirHandle(handle, { silent = false } = {}) {
+  splashEl.classList.remove('hidden');
+  splashTextEl.textContent = `기본 폴더에서 파일 목록 읽는 중… (${handle.name})`;
+  try {
+    const files = await collectFilesFromDir(handle);
+    if (!files.length) {
+      if (!silent) alert('기본 폴더에 불러올 파일이 없습니다 (.txt/.tsv/.csv/.json/이미지).');
+      return false;
+    }
+    loadFiles(files);
+    return true;
+  } catch (err) {
+    console.warn('기본 폴더 로드 실패:', err);
+    if (!silent) alert(`기본 폴더를 읽지 못했습니다: ${err.message}`);
+    return false;
+  } finally {
+    splashEl.classList.add('hidden');
+  }
+}
+
+// 사용자가 "기본 폴더 지정" 클릭 → 폴더 선택 후 저장하고 즉시 로드
+async function pickDefaultDir() {
+  if (!FS_SUPPORTED) {
+    alert('이 브라우저는 폴더 지정 기능을 지원하지 않습니다.\nChrome/Edge에서 열어주세요. (Firefox 미지원)');
+    return;
+  }
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ id: 'filetree-default', mode: 'read' });
+  } catch (err) {
+    if (err.name !== 'AbortError') console.warn(err);
+    return;
+  }
+  try { await idbSetHandle(handle); } catch (err) { console.warn('핸들 저장 실패:', err); }
+  renderDefaultDirBar('set', handle);
+  if (await ensureDirPermission(handle)) await loadFromDirHandle(handle);
+}
+
+// 페이지 로드 시 저장된 기본 폴더가 있으면 자동 로드 시도
+async function tryAutoLoadDefaultDir() {
+  if (!FS_SUPPORTED) {
+    pickDirBtn.classList.add('hidden');
+    return;
+  }
+  let handle;
+  try { handle = await idbGetHandle(); } catch (err) { handle = null; }
+  if (!handle) { renderDefaultDirBar('none'); return; }
+
+  // 권한이 이미 남아 있으면 클릭 없이 자동 로드, 아니면 버튼으로 안내
+  const perm = await handle.queryPermission({ mode: 'read' });
+  if (perm === 'granted') {
+    renderDefaultDirBar('set', handle);
+    await loadFromDirHandle(handle, { silent: true });
+  } else {
+    renderDefaultDirBar('reauth', handle);
+  }
+}
+
+// 상태 표시줄 렌더: 'none' | 'set' | 'reauth'
+function renderDefaultDirBar(state, handle) {
+  defaultDirStatus.innerHTML = '';
+  pickDirBtn.textContent = state === 'none' ? '기본 폴더 지정' : '기본 폴더 변경';
+
+  if (state === 'none') { defaultDirStatus.classList.add('hidden'); return; }
+  defaultDirStatus.classList.remove('hidden');
+
+  const label = document.createElement('span');
+  label.innerHTML = `기본 폴더: <span class="dir-name"></span>`;
+  label.querySelector('.dir-name').textContent = handle.name;
+  defaultDirStatus.appendChild(label);
+
+  if (state === 'reauth') {
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'mini-btn accent';
+    loadBtn.textContent = '불러오기';
+    loadBtn.addEventListener('click', async e => {
+      e.stopPropagation();
+      if (await ensureDirPermission(handle)) {
+        renderDefaultDirBar('set', handle);
+        await loadFromDirHandle(handle);
+      }
+    });
+    defaultDirStatus.appendChild(loadBtn);
+  }
+
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'mini-btn';
+  clearBtn.textContent = '해제';
+  clearBtn.addEventListener('click', async e => {
+    e.stopPropagation();
+    try { await idbDelHandle(); } catch (_) {}
+    renderDefaultDirBar('none');
+  });
+  defaultDirStatus.appendChild(clearBtn);
+}
 
 function setServerStatus(connected, text) {
   serverConnected = connected;
