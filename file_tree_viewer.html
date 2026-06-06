@@ -3148,7 +3148,10 @@ copyResultsBtn.addEventListener('click', () => {
   const lines = currentSearchMatches.map(m => {
     const sep = m.drive.sep || '/';
     const segs = m.isFolder ? m.pathSegs : [...m.pathSegs, m.ref.name];
-    return segsToFsPath(segs, sep);
+    const path = segsToFsPath(segs, sep);
+    // 용량 정보가 있는 드라이브면 경로 뒤에 " | "로 용량을 덧붙임
+    if (m.drive.hasSizes) return `${path} | ${formatSizeWithMode(m.size) || '0 B'}`;
+    return path;
   });
   navigator.clipboard.writeText(lines.join('\n')).then(() => {
     const orig = copyResultsBtn.textContent;
