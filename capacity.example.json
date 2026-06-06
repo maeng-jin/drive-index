@@ -13,5 +13,9 @@
     "label": "Backup Drive",
     "capacity": 2000000000000,
     "offset": 0
-  }
+  },
+  "exclude": [
+    "B:\\옮길 파일",
+    "E:\\temp"
+  ]
 }

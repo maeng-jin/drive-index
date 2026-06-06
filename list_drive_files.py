@@ -39,6 +39,7 @@
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -144,7 +145,41 @@ def is_excluded_at_root(entry_name: str, depth: int) -> bool:
     return depth == 1 and entry_name.lower() in SYSTEM_FOLDERS_AT_ROOT
 
 
-def scan_count(root: str, include_hidden: bool) -> int:
+def normalize_path(p: str) -> str:
+    """비교용 경로 정규화 (Windows: 대소문자/슬래시 무시)."""
+    return os.path.normcase(os.path.normpath(p))
+
+
+def is_excluded_dir(path: str, excludes) -> bool:
+    """path가 제외 경로와 같거나 그 하위면 True."""
+    if not excludes:
+        return False
+    norm = normalize_path(path)
+    for ex in excludes:
+        if norm == ex or norm.startswith(ex + os.sep):
+            return True
+    return False
+
+
+def load_excludes_from_capacity(capacity_path: Path):
+    """capacity.json의 최상위 "exclude" 배열에서 제외 경로 목록을 읽음."""
+    try:
+        with open(capacity_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[경고] capacity.json 읽기 실패 ({capacity_path}): {e}", file=sys.stderr)
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("exclude")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(p) for p in raw if isinstance(p, str) and p.strip()]
+
+
+def scan_count(root: str, include_hidden: bool, excludes=None) -> int:
     """파일 개수만 빠르게 사전 카운팅 (stat 없이)."""
     count = 0
     stack = [(root, 1)]
@@ -165,6 +200,8 @@ def scan_count(root: str, include_hidden: bool) -> int:
                         if is_dir:
                             if is_excluded_at_root(name, depth):
                                 continue
+                            if is_excluded_dir(entry.path, excludes):
+                                continue
                             stack.append((entry.path, depth + 1))
                         else:
                             count += 1
@@ -180,7 +217,7 @@ def scan_count(root: str, include_hidden: bool) -> int:
     return count
 
 
-def iter_dirs(root: str, include_hidden: bool, with_size: bool):
+def iter_dirs(root: str, include_hidden: bool, with_size: bool, excludes=None):
     """
     폴더 단위로 (folder_path, [(file_name, size_or_None), ...])를 yield.
     그룹 포맷 쓰기에 최적화된 형태.
@@ -206,6 +243,9 @@ def iter_dirs(root: str, include_hidden: bool, with_size: bool):
                         if is_excluded_at_root(name, depth):
                             print(f"\n[건너뜀] 시스템 폴더 제외: {name}", file=sys.stderr)
                             continue
+                        if is_excluded_dir(entry.path, excludes):
+                            print(f"\n[건너뜀] 제외 디렉토리: {entry.path}", file=sys.stderr)
+                            continue
                         subdirs.append((entry.path, depth + 1))
                     else:
                         if with_size:
@@ -228,7 +268,7 @@ def iter_dirs(root: str, include_hidden: bool, with_size: bool):
             yield path, files_in_dir
 
 
-def iter_files_flat(root: str, include_hidden: bool, with_size: bool):
+def iter_files_flat(root: str, include_hidden: bool, with_size: bool, excludes=None):
     """기존 flat 포맷용. (file_path, size) yield."""
     stack = [(root, 1)]
     while stack:
@@ -247,6 +287,9 @@ def iter_files_flat(root: str, include_hidden: bool, with_size: bool):
                     if is_dir:
                         if is_excluded_at_root(name, depth):
                             print(f"\n[건너뜀] 시스템 폴더 제외: {name}", file=sys.stderr)
+                            continue
+                        if is_excluded_dir(entry.path, excludes):
+                            print(f"\n[건너뜀] 제외 디렉토리: {entry.path}", file=sys.stderr)
                             continue
                         stack.append((entry.path, depth + 1))
                     else:
@@ -281,7 +324,32 @@ def main() -> int:
                         help="기존 flat 포맷으로 저장 (호환성 목적, 파일 크기 증가)")
     parser.add_argument("--buffer-size", type=int, default=10000,
                         help="쓰기 버퍼 크기 (기본: 10000)")
+    parser.add_argument("--capacity", default=None,
+                        help="capacity.json 경로. 'exclude' 배열의 디렉토리(하위 포함)를 "
+                             "기록에서 제외. 생략 시 현재 폴더의 capacity.json을 자동 탐색")
+    parser.add_argument("--exclude", action="append", default=[], metavar="DIR",
+                        help="제외할 디렉토리 경로 (하위 포함). 여러 번 지정 가능")
     args = parser.parse_args()
+
+    # 제외 경로 수집: capacity.json의 exclude + CLI --exclude
+    exclude_raw = []
+    capacity_path = None
+    if args.capacity:
+        capacity_path = Path(args.capacity).expanduser()
+    else:
+        default_cap = Path.cwd() / "capacity.json"
+        if default_cap.is_file():
+            capacity_path = default_cap
+    if capacity_path and capacity_path.is_file():
+        loaded = load_excludes_from_capacity(capacity_path)
+        if loaded:
+            print(f"capacity.json 제외 목록 {len(loaded)}개 로드: {capacity_path}", file=sys.stderr)
+        exclude_raw.extend(loaded)
+    exclude_raw.extend(args.exclude)
+    excludes = [normalize_path(p) for p in exclude_raw]
+    if excludes:
+        for p in exclude_raw:
+            print(f"  제외: {p}", file=sys.stderr)
 
     root = Path(args.path).expanduser().resolve()
     if not root.exists():
@@ -308,7 +376,7 @@ def main() -> int:
     total = None
     if not args.no_count:
         t0 = time.time()
-        total = scan_count(str(root), args.include_hidden)
+        total = scan_count(str(root), args.include_hidden, excludes)
         elapsed = time.time() - t0
         print(f"\n파일 수: {total:,} 개 (카운팅 {elapsed:.1f}s 소요)\n", file=sys.stderr)
 
@@ -332,7 +400,7 @@ def main() -> int:
         try:
             if args.flat:
                 # 기존 flat 포맷
-                for file_path, size in iter_files_flat(str(root), args.include_hidden, args.with_size):
+                for file_path, size in iter_files_flat(str(root), args.include_hidden, args.with_size, excludes):
                     if args.with_size:
                         buf.append(f"{file_path}\t{size}\n")
                         total_size += size
@@ -345,7 +413,7 @@ def main() -> int:
                         progress.update(buf_limit)
             else:
                 # 그룹 포맷
-                for folder_path, files_in_dir in iter_dirs(str(root), args.include_hidden, args.with_size):
+                for folder_path, files_in_dir in iter_dirs(str(root), args.include_hidden, args.with_size, excludes):
                     buf.append(f"{folder_path}\n")
                     for fname, fsize in files_in_dir:
                         if args.with_size:

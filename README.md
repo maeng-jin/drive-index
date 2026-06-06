@@ -36,7 +36,11 @@ python list_drive_files.py E:\ -o a.txt --with-size
 - `--no-count` — 사전 카운팅 생략 (즉시 시작, 진행률 % 대신 경과 기준)
 - `--include-hidden` — 숨김 파일 포함
 - `--flat` — 그룹 포맷(기본) 대신 flat 포맷
+- `--capacity <경로>` — `capacity.json`의 `exclude` 목록을 읽어 해당 디렉토리(하위 포함)를 기록에서 제외. 생략 시 현재 폴더의 `capacity.json`을 자동 탐색
+- `--exclude <경로>` — 제외할 디렉토리를 즉석 지정 (여러 번 가능, `capacity.json` 목록과 합쳐짐)
 - 진행률 표시 개선을 원하면 `pip install tqdm`
+
+> 제외는 **스캔(기록) 시점**에 적용됩니다. 이미 만든 `.txt`에는 소급되지 않으니, 제외를 반영하려면 해당 드라이브를 다시 스캔하세요.
 
 ### 2-A. 로컬 모드로 보기
 
@@ -146,6 +150,24 @@ E:\[게임]\다른게임
 - `label` — 뷰어 탭/대시보드에 표시할 친화적 이름 (선택)
 
 배열 형태나 다른 키 이름(`bytes`, `total`, `size` 등)도 지원합니다. `capacity.example.json` 참고.
+
+### 디렉토리 제외 (`exclude`)
+
+최상위에 `exclude` 배열을 추가하면, `list_drive_files.py`가 그 디렉토리와 **모든 하위**를 스캔에서 건너뜁니다. 예) 옮기는 중인 임시 폴더를 카탈로그에서 빼고 싶을 때.
+
+```json
+{
+  "a": { "label": "External Drive A", "capacity": 5000000000000, "offset": 0 },
+  "exclude": [
+    "B:\\옮길 파일",
+    "E:\\temp"
+  ]
+}
+```
+
+- 절대 경로 기준이며, 각 드라이브 스캔 시 자신의 루트 아래에 해당하는 항목만 걸러지므로 하나의 `capacity.json`을 공용으로 써도 됩니다.
+- Windows에서는 대소문자·슬래시(`/`↔`\`) 차이를 무시하고 비교합니다.
+- 뷰어는 `exclude` 키를 드라이브로 취급하지 않으니 같은 파일에 함께 둬도 안전합니다.
 
 ## 권장 워크플로우
 

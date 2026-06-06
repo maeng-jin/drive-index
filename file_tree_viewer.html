@@ -1721,7 +1721,10 @@ function parseCapacityObject(data) {
       }
     } else {
       // Flat object: { a: 4000..., b: { capacity, offset, label }, ... }
+      // 예약 메타 키는 드라이브가 아니므로 건너뜀 (예: 스캐너용 제외 경로 목록)
+      const RESERVED_KEYS = new Set(['exclude', 'excludes']);
       for (const [key, val] of Object.entries(data)) {
+        if (RESERVED_KEYS.has(key.toLowerCase())) continue;
         if (typeof val === 'number') {
           setEntry(key, val, 0, null);
         } else if (val && typeof val === 'object') {
