@@ -1278,16 +1278,17 @@ async function loadFromDirHandle(handle, { silent = false } = {}) {
     const files = await collectFilesFromDir(handle);
     if (!files.length) {
       if (!silent) alert('기본 폴더에 불러올 파일이 없습니다 (.txt/.tsv/.csv/.json/이미지).');
+      splashEl.classList.add('hidden');
       return false;
     }
+    // loadFiles는 비동기 진행률 표시를 시작하고 끝나면 스스로 splash를 닫는다
     loadFiles(files);
     return true;
   } catch (err) {
     console.warn('기본 폴더 로드 실패:', err);
     if (!silent) alert(`기본 폴더를 읽지 못했습니다: ${err.message}`);
-    return false;
-  } finally {
     splashEl.classList.add('hidden');
+    return false;
   }
 }
 
@@ -1375,6 +1376,56 @@ function setServerStatus(connected, text) {
   serverReloadBtn.classList.toggle('hidden', !connected);
 }
 
+// 남은 시간(초)을 사람이 읽기 좋은 문자열로
+function formatEta(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '남은 시간 계산 중…';
+  if (seconds < 1) return '거의 완료';
+  if (seconds < 60) return `약 ${Math.ceil(seconds)}초 남음`;
+  const m = Math.floor(seconds / 60), s = Math.ceil(seconds % 60);
+  return `약 ${m}분 ${s}초 남음`;
+}
+
+// 파싱 진행 상황을 splash에 표시: 로드된 파일 수 · 진행률 · 예상 남은 시간
+function updateLoadProgress(driveIdx, driveCount, filename, filesLoaded, processed, totalLines, startTime) {
+  const pct = totalLines > 0 ? Math.min(100, Math.round(processed / totalLines * 100)) : 0;
+  const elapsed = (performance.now() - startTime) / 1000;
+  const eta = processed > 0 ? elapsed / processed * (totalLines - processed) : Infinity;
+  const tag = driveCount > 1 ? `드라이브 ${driveIdx}/${driveCount} · ` : '';
+  splashTextEl.textContent =
+    `${tag}${filesLoaded.toLocaleString()}개 파일 로드됨 (${pct}%) · ${formatEta(eta)}`;
+}
+
+// 응답 본문을 스트리밍으로 읽어 바이트 진행률을 보고하며 텍스트를 반환
+async function fetchTextWithProgress(url, { onTotal, onChunk } = {}) {
+  const resp = await fetch(url, { cache: 'no-store' });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  // gzip 등으로 압축돼 오면 Content-Length(압축 크기)와 스트림(해제 크기)이 달라
+  // 총량을 알 수 없는 것으로 처리
+  const encoded = resp.headers.get('content-encoding');
+  const lenHeader = resp.headers.get('content-length');
+  const total = !encoded && lenHeader ? (parseInt(lenHeader, 10) || 0) : 0;
+  if (total > 0 && onTotal) onTotal(total);
+
+  // 스트리밍 미지원 환경은 통째로 받기
+  if (!resp.body || !resp.body.getReader) {
+    const text = await resp.text();
+    if (onChunk) onChunk(text.length);
+    return text;
+  }
+
+  const reader = resp.body.getReader();
+  const chunks = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    if (onChunk) onChunk(value.length);
+  }
+  // 바이트 청크를 UTF-8로 디코드 (멀티바이트 경계 안전하게 Blob 사용)
+  return await new Blob(chunks).text();
+}
+
 async function loadFromServer() {
   splashEl.classList.remove('hidden');
   splashTextEl.textContent = '서버에서 캐시 목록을 가져오는 중…';
@@ -1391,27 +1442,61 @@ async function loadFromServer() {
       return;
     }
 
-    splashTextEl.textContent = `${driveList.length}개 드라이브 로드 중…`;
+    // 1) 텍스트를 병렬로 받아오며, 완료 개수 + 바이트 진행률을 표시
+    let downloaded = 0;
+    let totalBytes = 0, loadedBytes = 0;
+    let lastPaint = 0;
+    const showDownloadProgress = (force) => {
+      const now = performance.now();
+      if (!force && now - lastPaint < 80) return; // 과도한 갱신 방지
+      lastPaint = now;
+      const remaining = driveList.length - downloaded;
+      let line = `드라이브 목록 다운로드 중… ${downloaded}/${driveList.length} 완료`;
+      if (totalBytes > 0) {
+        const pct = Math.min(100, Math.round(loadedBytes / totalBytes * 100));
+        line += ` · ${formatSize(loadedBytes) || '0 B'} / ${formatSize(totalBytes)} (${pct}%)`;
+      } else if (loadedBytes > 0) {
+        line += ` · ${formatSize(loadedBytes)}`;
+      }
+      line += ` · 남은 ${remaining}개`;
+      splashTextEl.textContent = line;
+    };
+    showDownloadProgress(true);
 
-    // 순차적으로 받아오되 너무 느리지 않게 병렬화
-    const results = await Promise.all(driveList.map(async d => {
+    const fetched = await Promise.all(driveList.map(async d => {
       try {
-        const resp = await fetch(d.txt_url, { cache: 'no-store' });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const text = await resp.text();
-        const drive = parseFileList(text, d.filename);
-        if (drive && d.thumbnail_url) {
-          drive.thumbnailUrl = d.thumbnail_url;
-          drive.thumbnailName = d.thumbnail_filename;
-        }
-        return drive;
+        const text = await fetchTextWithProgress(d.txt_url, {
+          onTotal: t => { totalBytes += t; showDownloadProgress(); },
+          onChunk: delta => { loadedBytes += delta; showDownloadProgress(); },
+        });
+        downloaded++;
+        showDownloadProgress(true);
+        return { d, text };
       } catch (err) {
-        console.warn(`드라이브 로드 실패: ${d.filename}`, err);
+        downloaded++;
+        showDownloadProgress(true);
+        console.warn(`드라이브 받기 실패: ${d.filename}`, err);
         return null;
       }
     }));
 
-    for (const d of results) if (d) drives.push(d);
+    // 2) 파싱은 순차로 진행률 표시
+
+    let idx = 0;
+    for (const item of fetched) {
+      if (!item) continue;
+      idx++;
+      const start = performance.now();
+      const drive = await parseFileList(item.text, item.d.filename,
+        (fl, done, total) => updateLoadProgress(idx, driveList.length, item.d.filename, fl, done, total, start));
+      if (drive) {
+        if (item.d.thumbnail_url) {
+          drive.thumbnailUrl = item.d.thumbnail_url;
+          drive.thumbnailName = item.d.thumbnail_filename;
+        }
+        drives.push(drive);
+      }
+    }
 
     // 용량 정보 적용
     if (manifest.capacity && Object.keys(manifest.capacity).length) {
@@ -1509,6 +1594,7 @@ function loadFiles(files) {
 
   // If only auxiliary files dropped (no new text), match images and apply capacity
   if (!txtFiles.length) {
+    splashEl.classList.add('hidden'); // 기본 폴더 경로에서 열어둔 splash가 있으면 닫기
     let matched = 0;
     for (const img of imgFiles) if (matchImageToDrive(img)) matched++;
 
@@ -1537,23 +1623,33 @@ function loadFiles(files) {
     return;
   }
 
-  // Load text files (sync via FileReader), then apply images + capacity json
-  let loaded = 0;
-  txtFiles.forEach(file => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const drive = parseFileList(e.target.result, file.name);
+  // 텍스트 파일을 순차로 읽고 진행률을 표시하며 파싱, 이후 이미지/용량 json 적용
+  loadTxtFilesWithProgress(txtFiles, imgFiles, jsonFiles);
+}
+
+async function loadTxtFilesWithProgress(txtFiles, imgFiles, jsonFiles) {
+  splashEl.classList.remove('hidden');
+  splashTextEl.textContent = `${txtFiles.length}개 파일 읽는 중…`;
+  try {
+    let idx = 0;
+    for (const file of txtFiles) {
+      idx++;
+      const start = performance.now();
+      let text;
+      try {
+        text = await file.text();
+      } catch (err) {
+        alert(`파일 읽기 실패: ${file.name}`);
+        continue;
+      }
+      const drive = await parseFileList(text, file.name,
+        (fl, done, total) => updateLoadProgress(idx, txtFiles.length, file.name, fl, done, total, start));
       if (drive) drives.push(drive);
-      loaded++;
-      if (loaded === txtFiles.length) finishLoad(imgFiles, jsonFiles);
-    };
-    reader.onerror = () => {
-      loaded++;
-      alert(`파일 읽기 실패: ${file.name}`);
-      if (loaded === txtFiles.length) finishLoad(imgFiles, jsonFiles);
-    };
-    reader.readAsText(file, 'UTF-8');
-  });
+    }
+  } finally {
+    splashEl.classList.add('hidden');
+  }
+  finishLoad(imgFiles, jsonFiles);
 }
 
 function finishLoad(imgFiles, jsonFiles) {
@@ -2024,7 +2120,12 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') navigateLightbox(1);
 });
 
-function parseFileList(text, filename) {
+// UI가 페인트할 수 있도록 이벤트 루프에 양보
+function yieldToUI() {
+  return new Promise(r => setTimeout(r, 0));
+}
+
+async function parseFileList(text, filename, onProgress) {
   // 줄 분리 (빈 줄 제외하지 않음 — 인덱싱 그대로 보존). 단 끝의 빈 줄은 제거.
   let lines = text.split(/\r?\n/);
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
@@ -2077,39 +2178,55 @@ function parseFileList(text, filename) {
   const root = { name: '/', children: new Map(), files: [], isRoot: true };
   let totalFiles = 0, totalSize = 0;
 
+  // 진행률용: 처리할 데이터 줄 수와 청크 크기
+  const totalLines = lines.length - startIdx;
+  const CHUNK = 40000;
+
   if (isGrouped) {
     // 그룹 포맷 — 현재 폴더를 들고 다니면서 파일 행이 나오면 그 폴더에 추가
     let currentFolderNode = null;
     for (let i = startIdx; i < lines.length; i++) {
       const line = lines[i];
-      if (line === '') continue;
-      if (line.startsWith('\t')) {
-        // 파일 줄
-        if (!currentFolderNode) continue; // 부모 폴더 없이 나온 파일은 스킵
-        const parts = line.substring(1).split('\t');
-        const fname = parts[0];
-        const size = hasSizes && parts[1] ? parseInt(parts[1], 10) || 0 : 0;
-        currentFolderNode.files.push({ name: fname, size });
-        totalFiles++;
-        totalSize += size;
-      } else {
-        // 폴더 줄 — 이 폴더를 트리에 ensure하고 currentFolderNode로 설정
-        currentFolderNode = ensureFolder(root, line, sep);
+      if (line !== '') {
+        if (line.startsWith('\t')) {
+          // 파일 줄
+          if (currentFolderNode) { // 부모 폴더 없이 나온 파일은 스킵
+            const parts = line.substring(1).split('\t');
+            const fname = parts[0];
+            const size = hasSizes && parts[1] ? parseInt(parts[1], 10) || 0 : 0;
+            currentFolderNode.files.push({ name: fname, size });
+            totalFiles++;
+            totalSize += size;
+          }
+        } else {
+          // 폴더 줄 — 이 폴더를 트리에 ensure하고 currentFolderNode로 설정
+          currentFolderNode = ensureFolder(root, line, sep);
+        }
+      }
+      if (onProgress && (i - startIdx) % CHUNK === CHUNK - 1) {
+        onProgress(totalFiles, i - startIdx + 1, totalLines);
+        await yieldToUI();
       }
     }
   } else {
     // Flat 포맷 — 기존 방식
     for (let i = startIdx; i < lines.length; i++) {
       const line = lines[i];
-      if (line === '') continue;
-      const parts = line.split('\t');
-      const path = parts[0];
-      const size = hasSizes && parts[1] ? parseInt(parts[1], 10) || 0 : 0;
-      addPathToTree(root, path, size, sep);
-      totalFiles++;
-      totalSize += size;
+      if (line !== '') {
+        const parts = line.split('\t');
+        const path = parts[0];
+        const size = hasSizes && parts[1] ? parseInt(parts[1], 10) || 0 : 0;
+        addPathToTree(root, path, size, sep);
+        totalFiles++;
+        totalSize += size;
+      }
+      if (onProgress && (i - startIdx) % CHUNK === CHUNK - 1) {
+        onProgress(totalFiles, i - startIdx + 1, totalLines);
+        await yieldToUI();
+      }
     }
   }
+  if (onProgress) onProgress(totalFiles, totalLines, totalLines);
 
   let totalFolders = 0;
   const aggregate = node => {
